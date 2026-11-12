@@ -17,29 +17,46 @@ NUM_TILES = NOPE_DIM // TILE
 SCALES_OFFSET = NOPE_DIM
 ROPE_OFFSET = SCALES_OFFSET + NUM_TILES * 4
 ENTRY_BYTES = ROPE_OFFSET + PE_DIM * 2
+NO_ROPE_ENTRY_BYTES = ROPE_OFFSET
 SCALE_DIVISOR = 448.0
+MIN_SCALE = 1e-4
 
 DTYPES = [torch.bfloat16, torch.half]
 BLOCK_SIZES = [16, 64]
 
 
-def _ref_pack(kv_c: torch.Tensor, k_pe: torch.Tensor) -> torch.Tensor:
-    """Reference 656-byte packing of one batch of tokens."""
+def _ceil_pow2(x: torch.Tensor) -> torch.Tensor:
+    """Smallest power of two >= x (x > 0), computed exactly."""
+    mantissa, exponent = torch.frexp(x)
+    return torch.ldexp(torch.ones_like(x),
+                       torch.where(mantissa == 0.5, exponent - 1, exponent))
+
+
+def _ref_pack(kv_c: torch.Tensor,
+              k_pe: torch.Tensor,
+              entry_bytes: int = ENTRY_BYTES) -> torch.Tensor:
+    """Reference packing, a torch port of the CUDA writer
+    (concat_and_cache_ds_mla_kernel in vllm csrc/cache_kernels.cu): per-tile
+    scale max(amax / 448, 1e-4) rounded up to a power of two, fp8-e4m3 NoPE,
+    fp32 scales, then the RoPE tail (zeros for a rope-free k_pe of width 0;
+    absent for 528-byte entries)."""
     num_tokens = kv_c.shape[0]
     nope = kv_c.float().view(num_tokens, NUM_TILES, TILE)
-    scales = (nope.abs().amax(dim=-1) / SCALE_DIVISOR).clamp(
-        min=torch.finfo(torch.float32).tiny)
+    scales = _ceil_pow2(
+        (nope.abs().amax(dim=-1) / SCALE_DIVISOR).clamp(min=MIN_SCALE))
     quantized = (nope / scales.unsqueeze(-1)).to(torch.float8_e4m3fn)
 
-    packed = torch.empty((num_tokens, ENTRY_BYTES),
+    packed = torch.empty((num_tokens, entry_bytes),
                          dtype=torch.uint8,
                          device=kv_c.device)
     packed[:, :SCALES_OFFSET] = quantized.reshape(num_tokens,
                                                   NOPE_DIM).view(torch.uint8)
     packed[:, SCALES_OFFSET:ROPE_OFFSET] = scales.contiguous().view(torch.uint8)
-    # The RoPE tail is always stored as BF16.
-    packed[:, ROPE_OFFSET:] = k_pe.to(torch.bfloat16).contiguous().view(
-        torch.uint8)
+    if entry_bytes == ENTRY_BYTES:
+        # The RoPE tail is always stored as BF16.
+        rope = (k_pe.to(torch.bfloat16) if k_pe.shape[1] else torch.zeros(
+            num_tokens, PE_DIM, dtype=torch.bfloat16, device=kv_c.device))
+        packed[:, ROPE_OFFSET:] = rope.contiguous().view(torch.uint8)
     return packed
 
 
@@ -62,19 +79,29 @@ def _ref_unpack(packed: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
 @pytest.mark.parametrize("num_tokens", [1, 42])
+@pytest.mark.parametrize("pe_dim,entry_bytes", [(PE_DIM, ENTRY_BYTES),
+                                                (0, ENTRY_BYTES),
+                                                (0, NO_ROPE_ENTRY_BYTES)])
 @torch.inference_mode()
 def test_concat_and_cache_ds_mla(dtype: torch.dtype, block_size: int,
-                                 num_tokens: int) -> None:
+                                 num_tokens: int, pe_dim: int,
+                                 entry_bytes: int) -> None:
+    """Byte-exact against the CUDA writer layout, including rope-free
+    (pe_dim == 0) models, tiny values (1e-4 scale floor) and all-zero
+    tiles."""
     seed_everything(0)
     num_blocks = 8
     kv_c = torch.randn(num_tokens,
                        NOPE_DIM,
                        dtype=dtype,
                        device=KERNEL_DEVICE)
-    k_pe = torch.randn(num_tokens, PE_DIM, dtype=dtype, device=KERNEL_DEVICE)
+    # Tile 0 of token 0 is all zeros, tile 1 is far below the scale floor.
+    kv_c[0, :TILE] = 0
+    kv_c[0, TILE:2 * TILE] *= 1e-6
+    k_pe = torch.randn(num_tokens, pe_dim, dtype=dtype, device=KERNEL_DEVICE)
     kv_cache = torch.zeros(num_blocks,
                            block_size,
-                           ENTRY_BYTES,
+                           entry_bytes,
                            dtype=torch.uint8,
                            device=KERNEL_DEVICE)
 
@@ -87,9 +114,9 @@ def test_concat_and_cache_ds_mla(dtype: torch.dtype, block_size: int,
     scale = torch.ones(1, dtype=torch.float32, device=KERNEL_DEVICE)
     concat_and_cache_mla(kv_c, k_pe, kv_cache, slots, "fp8_ds_mla", scale)
 
-    entries = kv_cache.view(-1, ENTRY_BYTES)
+    entries = kv_cache.view(-1, entry_bytes)
     written = slots >= 0
-    ref = _ref_pack(kv_c[written], k_pe[written])
+    ref = _ref_pack(kv_c[written], k_pe[written], entry_bytes)
     torch.testing.assert_close(entries[slots[written]].cpu(), ref.cpu())
     if num_tokens > 1:
         untouched = torch.ones(num_blocks * block_size,
@@ -166,15 +193,18 @@ def test_cp_gather_and_upconvert_fp8_kv_cache(block_size: int,
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("pe_dim", [PE_DIM, 0])
 @torch.inference_mode()
-def test_ds_mla_pack_then_gather(dtype: torch.dtype) -> None:
-    """Pack with concat_and_cache_mla and read back with the gather op."""
+def test_ds_mla_pack_then_gather(dtype: torch.dtype, pe_dim: int) -> None:
+    """Pack with concat_and_cache_mla and read back with the gather op; a
+    rope-free entry reads back with a zero RoPE tail."""
     seed_everything(0)
     block_size = 16
     num_tokens = 2 * block_size
     kv_c = torch.randn(num_tokens, NOPE_DIM, dtype=dtype, device=KERNEL_DEVICE)
-    k_pe = torch.randn(num_tokens, PE_DIM, dtype=dtype, device=KERNEL_DEVICE)
-    k_pe[0, :4] = torch.tensor([1.0, -1.0, 0.5, 2.0], dtype=dtype)
+    k_pe = torch.randn(num_tokens, pe_dim, dtype=dtype, device=KERNEL_DEVICE)
+    if pe_dim:
+        k_pe[0, :4] = torch.tensor([1.0, -1.0, 0.5, 2.0], dtype=dtype)
     kv_cache = torch.zeros(2,
                            block_size,
                            ENTRY_BYTES,
@@ -195,8 +225,10 @@ def test_ds_mla_pack_then_gather(dtype: torch.dtype) -> None:
     cp_gather_and_upconvert_fp8_kv_cache(kv_cache, dst, block_table,
                                          workspace_starts, 1, None)
 
+    expected_rope = (k_pe.to(torch.bfloat16) if pe_dim else torch.zeros(
+        num_tokens, PE_DIM, dtype=torch.bfloat16, device=KERNEL_DEVICE))
     torch.testing.assert_close(dst[:, NOPE_DIM:].cpu(),
-                               k_pe.to(torch.bfloat16).cpu(),
+                               expected_rope.cpu(),
                                atol=0,
                                rtol=0)
     torch.testing.assert_close(dst[:, :NOPE_DIM].float().cpu(),
