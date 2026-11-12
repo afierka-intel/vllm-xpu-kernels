@@ -18,6 +18,10 @@ constexpr float kFp8E4M3ScaleDivisor = 448.f;
 // DSV3.2 packed MLA cache entry ("fp8_ds_mla"): 512B fp8-e4m3 NoPE stored as
 // 4 tiles of 128 elements, 16B of per-tile fp32 scales, then 128B of BF16 RoPE
 // (FP16 inputs are converted so readers can always decode it as BF16).
+// Rope-free models (pe_dim == 0) use the same 656B entry with a zero RoPE
+// tail, or a 528B entry without it, as the CUDA writer does.
+// Tile scales follow the CUDA writer: max(amax / 448, 1e-4) rounded up to a
+// power of two, so the cache bytes match across platforms.
 constexpr int kDsMlaNopeDim = 512;
 constexpr int kDsMlaPeDim = 64;
 constexpr int kDsMlaTile = 128;
@@ -25,8 +29,20 @@ constexpr int kDsMlaNumTiles = kDsMlaNopeDim / kDsMlaTile;
 constexpr int kDsMlaScalesOffset = kDsMlaNopeDim;
 constexpr int kDsMlaRopeOffset = kDsMlaScalesOffset + kDsMlaNumTiles * 4;
 constexpr int kDsMlaEntryBytes = kDsMlaRopeOffset + kDsMlaPeDim * 2;
+constexpr int kDsMlaNoRopeEntryBytes = kDsMlaRopeOffset;
+constexpr float kDsMlaMinScale = 1e-4f;
 
 namespace vllm {
+
+// Smallest power of two >= x for a positive normal float (exact, unlike
+// exp2(ceil(log2(x))) under approximate device math).
+inline float ds_mla_ceil_pow2(float x) {
+  uint32_t bits = sycl::bit_cast<uint32_t>(x);
+  if (bits & 0x007fffffu) {
+    bits = (bits & 0xff800000u) + 0x00800000u;
+  }
+  return sycl::bit_cast<float>(bits & 0xff800000u);
+}
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 class reshape_and_cache_kernel {
@@ -898,7 +914,8 @@ class concat_and_cache_ds_mla_kernel {
       const int64_t entry_stride,
       const int64_t kv_c_stride,
       const int64_t k_pe_stride,
-      const int block_size)
+      const int block_size,
+      const int pe_dim)
       : kv_c_(kv_c),
         k_pe_(k_pe),
         kv_cache_(kv_cache),
@@ -907,7 +924,8 @@ class concat_and_cache_ds_mla_kernel {
         entry_stride_(entry_stride),
         kv_c_stride_(kv_c_stride),
         k_pe_stride_(k_pe_stride),
-        block_size_(block_size) {}
+        block_size_(block_size),
+        pe_dim_(pe_dim) {}
 
   void operator()(const sycl::nd_item<2>& item) const {
     const int64_t token_idx = item.get_group(1);
@@ -930,7 +948,9 @@ class concat_and_cache_ds_mla_kernel {
       rope_t* __restrict__ dst =
           reinterpret_cast<rope_t*>(entry + kDsMlaRopeOffset);
       for (int i = lid; i < kDsMlaPeDim; i += TILE_THREADS) {
-        dst[i] = static_cast<rope_t>(static_cast<float>(src[i]));
+        // pe_dim == 0: rope-free model, the tail is a zero RoPE envelope.
+        dst[i] = pe_dim_ == 0 ? rope_t(0.f)
+                              : static_cast<rope_t>(static_cast<float>(src[i]));
       }
       return;
     }
@@ -949,8 +969,10 @@ class concat_and_cache_ds_mla_kernel {
     amax =
         sycl::reduce_over_group(item.get_group(), amax, sycl::maximum<float>{});
 
-    const float tile_scale = sycl::fmax(
-        amax / kFp8E4M3ScaleDivisor, std::numeric_limits<float>::min());
+    // Power-of-two scale, as the CUDA writer: the fp8 values and scales are
+    // byte-identical across platforms, and dividing by it is exact.
+    const float tile_scale = ds_mla_ceil_pow2(
+        sycl::fmax(amax / kFp8E4M3ScaleDivisor, kDsMlaMinScale));
     if (lid == 0) {
       reinterpret_cast<float*>(entry + kDsMlaScalesOffset)[part] = tile_scale;
     }
@@ -976,6 +998,7 @@ class concat_and_cache_ds_mla_kernel {
   const int64_t kv_c_stride_;
   const int64_t k_pe_stride_;
   const int block_size_;
+  const int pe_dim_;
 };
 
 // Gathers DSV3.2 packed entries out of the paged cache into a dense BF16
@@ -1250,7 +1273,8 @@ void reshape_and_cache_flash(
           entry_stride,                                              \
           kv_c_stride,                                               \
           k_pe_stride,                                               \
-          block_size));
+          block_size,                                                \
+          pe_dim));
 
 void concat_and_cache_mla(
     torch::Tensor& kv_c,          // [num_tokens, kv_lora_rank]
@@ -1281,15 +1305,22 @@ void concat_and_cache_mla(
     TORCH_CHECK(
         kv_lora_rank == kDsMlaNopeDim,
         "kv_lora_rank must be 512 for fp8_ds_mla");
-    TORCH_CHECK(pe_dim == kDsMlaPeDim, "pe_dim must be 64 for fp8_ds_mla");
     TORCH_CHECK(
-        kv_cache.size(2) == kDsMlaEntryBytes / kv_cache.element_size(),
-        "kv_cache.size(2) must be 656 bytes for fp8_ds_mla");
+        pe_dim == kDsMlaPeDim || pe_dim == 0,
+        "pe_dim must be 64 or 0 for fp8_ds_mla, got ",
+        pe_dim);
+    const int64_t row_bytes = kv_cache.size(2) * kv_cache.element_size();
+    TORCH_CHECK(
+        row_bytes == kDsMlaEntryBytes ||
+            (pe_dim == 0 && row_bytes == kDsMlaNoRopeEntryBytes),
+        "fp8_ds_mla requires 656-byte rows, or 528-byte rows with "
+        "pe_dim == 0, got ",
+        row_bytes);
     TORCH_CHECK(
         kv_c.element_size() == 2,
         "kv_c.element_size() must be 2 for fp8_ds_mla");
     TORCH_CHECK(
-        k_pe.scalar_type() == kv_c.scalar_type(),
+        pe_dim == 0 || k_pe.scalar_type() == kv_c.scalar_type(),
         "k_pe and kv_c must have the same dtype for fp8_ds_mla");
     TORCH_CHECK(
         kv_cache.stride(2) == 1,
@@ -1314,7 +1345,11 @@ void concat_and_cache_mla(
     block_stride *= kv_cache.element_size();
     entry_stride *= kv_cache.element_size();
     constexpr int kDsMlaTileThreads = 32;
-    sycl::range<2> grid(kDsMlaNumTiles + 1, num_tokens);
+    // One group per NoPE tile, plus one for the RoPE tail when the entry has
+    // it (zeros when pe_dim == 0).
+    const bool has_rope_tail =
+        kv_cache.size(2) * kv_cache.element_size() == kDsMlaEntryBytes;
+    sycl::range<2> grid(kDsMlaNumTiles + (has_rope_tail ? 1 : 0), num_tokens);
     sycl::range<2> block(kDsMlaTileThreads, 1);
     if (kv_c.scalar_type() == at::ScalarType::BFloat16) {
       CALL_CONCAT_AND_CACHE_DS_MLA(sycl::ext::oneapi::bfloat16);
