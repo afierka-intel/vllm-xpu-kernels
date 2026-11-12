@@ -274,3 +274,67 @@ def test_top_k_per_row_decode_large_vocab_size(
     data_generation = "random"
     _run_top_k_per_row_decode_test(top_k, batch_size, next_n, vocab_size,
                                    data_generation)
+
+
+# Logit width per code path of top_k_per_row_decode: insertion sort
+# (< 12288 columns), radix (< 200000) and the two-step split + merge.
+SEQ_LENS_2D_WIDTHS = [4096, 20000, 300000]
+
+
+@pytest.mark.parametrize("next_n", [1, 2, 3])
+@pytest.mark.parametrize("batch_size", [2, 5])
+@pytest.mark.parametrize("top_k", [64, 2048])
+@pytest.mark.parametrize("width", SEQ_LENS_2D_WIDTHS)
+@torch.inference_mode()
+def test_top_k_per_row_decode_2d_seq_lens(
+    next_n: int,
+    batch_size: int,
+    top_k: int,
+    width: int,
+) -> None:
+    """
+    2D seq_lens (B, next_n) carry one effective length per logit row, as the
+    sparse indexer passes them for native speculative decode. Columns at or
+    past a row's length hold +1e20, so reading past the end of a row (or
+    taking another request's length) selects those columns.
+    """
+    torch.xpu.memory.empty_cache()
+    device = "xpu"
+    gen = torch.Generator(device="cpu").manual_seed(0)
+
+    num_rows = batch_size * next_n
+    # Distinct, ragged lengths; at least one row shorter than top_k.
+    row_ends = torch.randint(1, width + 1, (num_rows, ), generator=gen)
+    row_ends[0] = min(top_k // 2, width)
+    row_ends = row_ends.to(torch.int32)
+    seq_lens = row_ends.view(batch_size, next_n).to(device)
+
+    logits = torch.randn(num_rows, width, generator=gen).to(device)
+    cols = torch.arange(width, device=device)
+    row_ends = row_ends.to(device)
+    logits.masked_fill_(cols[None, :] >= row_ends[:, None], 1e20)
+
+    indices = torch.full((num_rows, top_k),
+                         -777,
+                         dtype=torch.int32,
+                         device=device)
+    topk_per_row_decode(logits, next_n, seq_lens, indices, num_rows, top_k)
+    torch.xpu.synchronize()
+
+    masked = logits.masked_fill(cols[None, :] >= row_ends[:, None],
+                                float("-inf"))
+    torch_indices = masked.topk(min(top_k, width), dim=-1)[1]
+    in_range = torch.arange(torch_indices.shape[1],
+                            device=device)[None, :] < row_ends[:, None]
+    torch_indices = torch.where(in_range, torch_indices, -1)
+
+    num_valid = torch.clamp(row_ends, max=top_k)
+    valid_slot = torch.arange(top_k, device=device)[None, :] < num_valid[:,
+                                                                         None]
+    # Every valid slot holds an in-row column; no column past the row end.
+    assert bool(((indices >= 0) & (indices < row_ends[:, None]))[valid_slot]
+                .all()), "top_k_per_row_decode read past a row's 2D seq_len"
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
+    assert compare_top_k_results(
+        logits, indices, torch_indices, row_starts, row_ends,
+        top_k), "XPU top_k_per_row_decode (2D seq_lens) != torch.topk"

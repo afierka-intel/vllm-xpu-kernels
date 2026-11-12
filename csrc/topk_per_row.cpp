@@ -725,6 +725,7 @@ class top_k_per_row_decode_kernel {
       int64_t stride1,
       int64_t topK,
       int64_t next_n,
+      int seqLensIs2D = 0,
       float* outLogits = nullptr,
       const int numBlocksToMerge = 0,
       const int32_t* indices = nullptr)
@@ -736,6 +737,7 @@ class top_k_per_row_decode_kernel {
         stride1_(stride1),
         topK_(topK),
         next_n_(next_n),
+        seqLensIs2D_(seqLensIs2D),
         outLogits_(outLogits),
         numBlocksToMerge_(numBlocksToMerge),
         indices_(indices) {}
@@ -751,8 +753,20 @@ class top_k_per_row_decode_kernel {
 
     // The range of logits within the row.
     int rowStart = 0;
-    int32_t seq_len = seqLens_[rowIdx / next_n_];
-    int rowEnd = seq_len - next_n_ + (rowIdx % next_n_) + 1;
+    // seqLensIs2D == 0: seqLens is 1D (B,); all rows of a request share one
+    //                   seq_len and the per-row end is derived from next_n.
+    // seqLensIs2D == 1: seqLens is 2D (B, next_n), C-contiguous; each logit
+    //                   row has its own pre-computed effective length, so the
+    //                   flat row index maps directly to seqLens[b, j].
+    // Same contract as the CUDA kernel in vllm/csrc/sampler.cu.
+    int32_t seq_len =
+        seqLensIs2D_ ? seqLens_[rowIdx] : seqLens_[rowIdx / next_n_];
+    int rowEnd =
+        seqLensIs2D_
+            ? sycl::max(0, seq_len)
+            : sycl::max(
+                  0,
+                  static_cast<int>(seq_len - next_n_ + (rowIdx % next_n_) + 1));
 
     const float* logits = logits_;
     const int* indices = indices_;
@@ -803,6 +817,7 @@ class top_k_per_row_decode_kernel {
   int64_t stride1_;
   int64_t topK_;
   int64_t next_n_;
+  int seqLensIs2D_;
   float* outLogits_;
   const int numBlocksToMerge_;
   const int32_t* indices_;
@@ -823,7 +838,28 @@ void top_k_per_row_decode(
   TORCH_CHECK(logits.stride(0) == stride0);
   TORCH_CHECK(logits.stride(1) == stride1);
 
-  TORCH_CHECK(seqLens.size(0) == numRows / next_n);
+  // seqLens is either 1D (B,) with numRows == B * next_n, or 2D (B, next_n)
+  // holding one pre-computed effective length per logit row. A (B, 1) tensor
+  // is read as 1D, which is the same thing for next_n == 1.
+  TORCH_CHECK(
+      seqLens.dim() == 1 || seqLens.dim() == 2,
+      "seqLens must be 1D (B,) or 2D (B, next_n), got ",
+      seqLens.dim(),
+      "D");
+  TORCH_CHECK(seqLens.scalar_type() == at::kInt, "seqLens must be int32");
+  const int seqLensIs2D = seqLens.dim() == 2 && seqLens.size(1) != 1 ? 1 : 0;
+  if (seqLensIs2D) {
+    TORCH_CHECK(seqLens.is_contiguous(), "2D seqLens must be contiguous");
+    TORCH_CHECK(
+        seqLens.size(1) == next_n,
+        "2D seqLens must have next_n columns, got ",
+        seqLens.size(1),
+        " for next_n=",
+        next_n);
+    TORCH_CHECK(seqLens.numel() == numRows);
+  } else {
+    TORCH_CHECK(seqLens.numel() == numRows / next_n);
+  }
 
   TORCH_CHECK(indices.size(0) == numRows);
   TORCH_CHECK(indices.size(1) == topK);
@@ -856,7 +892,8 @@ void top_k_per_row_decode(
               stride0,
               stride1,
               topK,
-              next_n));
+              next_n,
+              seqLensIs2D));
     });
   } else if (numColumns < kSplitWorkThreshold) {
     // From this threshold, use radix sort instead
@@ -880,7 +917,8 @@ void top_k_per_row_decode(
               stride0,
               stride1,
               topK,
-              next_n));
+              next_n,
+              seqLensIs2D));
     });
   } else {
     // Long sequences are run in two steps
@@ -917,6 +955,7 @@ void top_k_per_row_decode(
               stride1,
               topK,
               next_n,
+              seqLensIs2D,
               outLogitsAux.data_ptr<float>()));
     });
 
@@ -945,6 +984,7 @@ void top_k_per_row_decode(
               1,
               topK,
               next_n,
+              seqLensIs2D,
               /*outLogits=*/nullptr,
               multipleBlocksPerRowConfig,
               outIndicesAux.data_ptr<int32_t>()));
